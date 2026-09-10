@@ -189,16 +189,6 @@ SyncLogger logger("stage0.log");
 AsyncLogging/build/stage0.log
 ```
 
-## 为什么启动时调用 `unlink()`
-
-```cpp
-::unlink("stage0.log");
-```
-
-`FileWriter` 使用 `O_APPEND`，如果保留旧日志，反复运行程序就会不断追加内容。这里先删除同名测试日志，是为了让每次教学验证都稳定地产生两行结果。
-
-这只是教学程序的测试行为。真实日志服务通常不能在启动时无条件删除历史日志。
-
 ## 当前阶段的边界
 
 Stage 0 已经实现：
@@ -210,39 +200,3 @@ Stage 0 已经实现：
 - 保存最后一次 I/O 错误；
 - 提供 `fsync()` 封装；
 - 为每条日志追加换行。
-
-Stage 0 尚未实现：
-
-- 后台线程；
-- 线程安全保证；
-- 有界阻塞队列和背压；
-- 批量写入；
-- 日志级别、时间和线程 ID；
-- 文件滚动；
-- 自动化测试；
-- 对 `main()` 中两次 `log()` 返回值的检查。
-
-## 下一阶段
-
-Stage 1 将先实现一个单工作线程执行器，理解任务所有权和 Drain 关闭：
-
-```text
-调用线程提交任务
-        ↓
-有界或无界任务队列
-        ↓
-工作线程取出任务
-        ↓
-FileWriter 写入文件
-```
-
-这一阶段会开始使用：
-
-```cpp
-std::thread
-std::mutex
-std::condition_variable
-std::queue
-```
-
-届时再在 `CMakeLists.txt` 中增加 `stage1_mini_pool` 目标和线程库依赖，不提前声明尚未创建的源文件。
