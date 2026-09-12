@@ -5,7 +5,8 @@
 目前已经完成：
 
 - Stage 0：同步文件写入；
-- Stage 1：单工作线程任务队列与异步日志边界。
+- Stage 1：单工作线程任务队列与异步日志边界；
+- Stage 2：专用有界阻塞队列与双生产者日志写入。
 
 ## 当前进度
 
@@ -13,7 +14,7 @@
 | --------------------- | ------ | ------------------------------------------------------ |
 | Stage 0：同步日志     | 已完成 | FD 的 RAII、短写、`EINTR`、`fsync()`               |
 | Stage 1：迷你线程池   | 已完成 | 单工作线程、任务队列、条件变量、Drain 关闭、消息所有权 |
-| Stage 2：专用异步队列 | 计划中 | 从通用任务队列改为有界日志队列，引入背压               |
+| Stage 2：专用异步队列 | 已完成 | 有界阻塞队列、双条件变量、关闭唤醒、Drain 语义         |
 | Stage 3：批量写入     | 计划中 | 批量取出日志，减少系统调用                             |
 | Stage 4：双缓冲       | 计划中 | `FixedBuffer`、锁内交换、锁外 I/O                    |
 | Final：完整日志库     | 计划中 | 格式化、级别、滚动文件、`flush()`、统计与测试        |
@@ -50,6 +51,19 @@ flowchart LR
 
 Stage 1 的 `log()` 不再直接写文件，而是把拥有完整日志内容的 Lambda 放进任务队列。唯一工作线程依次取出任务并调用 `FileWriter::append()`。
 
+### Stage 2：专用有界日志队列
+
+```mermaid
+flowchart LR
+    P1[生产者线程 1] -->|push string| Q[BoundedBlockingQueue]
+    P2[生产者线程 2] -->|push string| Q
+    Q -->|pop optional string| W[日志工作线程]
+    W --> F[FileWriter]
+    F --> L[stage2.log]
+```
+
+Stage 2 不再把日志包装成通用的 `std::function<void()>`，而是直接传递 `std::string`。队列容量固定为 1024；队列满时生产者等待，形成最基础的阻塞背压。
+
 ## 项目目录
 
 ```text
@@ -59,7 +73,8 @@ AsyncLogging/
 ├── .gitignore
 └── stages/
     ├── stage0_sync.cpp
-    └── stage1_mini_pool.cpp
+    ├── stage1_mini_pool.cpp
+    └── stage2_async_queue.cpp
 ```
 
 `build/` 和运行生成的 `*.log` 已由 `.gitignore` 排除，不会进入 Git 仓库。
@@ -95,14 +110,16 @@ cmake --build build -j
 ```bash
 cmake --build build --target stage0_sync -j
 cmake --build build --target stage1_mini_pool -j
+cmake --build build --target stage2_async_queue -j
 ```
 
 当前可执行目标：
 
-| 目标                 | 源文件                          | 是否需要线程库               |
-| -------------------- | ------------------------------- | ---------------------------- |
-| `stage0_sync`      | `stages/stage0_sync.cpp`      | 否                           |
-| `stage1_mini_pool` | `stages/stage1_mini_pool.cpp` | 是，链接`Threads::Threads` |
+| 目标                   | 源文件                            | 是否需要线程库               |
+| ---------------------- | --------------------------------- | ---------------------------- |
+| `stage0_sync`        | `stages/stage0_sync.cpp`        | 否                           |
+| `stage1_mini_pool`   | `stages/stage1_mini_pool.cpp`   | 是，链接`Threads::Threads` |
+| `stage2_async_queue` | `stages/stage2_async_queue.cpp` | 是，链接`Threads::Threads` |
 
 ## 运行 Stage 0
 
@@ -163,7 +180,30 @@ task 999
 ```text
 AsyncLogging/build/stage0.log
 AsyncLogging/build/stage1_pool.log
+AsyncLogging/build/stage2.log
 ```
+
+## 运行 Stage 2
+
+在 `build/` 目录中执行：
+
+```bash
+./stage2_async_queue
+wc -l stage2.log
+grep -c '^first producer:' stage2.log
+grep -c '^second producer:' stage2.log
+```
+
+预期结果：
+
+```text
+wrote 2000 lines to stage2.log
+2000 stage2.log
+1000
+1000
+```
+
+两个生产者并发提交，因此两组日志在文件中的交错顺序不固定；但唯一消费者串行写文件，所以每条完整日志不会与另一条日志的字节交叉。
 
 ## Stage 0 的核心设计
 
@@ -306,24 +346,124 @@ MiniThreadPool pool_;
 
 因此销毁时先析构 `pool_`，由它停止并 `join` 后台线程；随后才析构 `writer_` 并关闭文件。这样队列中的任务不会访问已经销毁的文件对象。
 
+## Stage 2 的核心设计
+
+### 为什么从通用线程池改为专用队列
+
+Stage 1 的队列元素是：
+
+```cpp
+std::function<void()>
+```
+
+但日志后台只做一件事：把字符串写进文件。Stage 2 直接保存：
+
+```cpp
+std::string
+```
+
+这样数据流更清楚，也为后续批量取出字符串、拼接缓冲区做好准备。
+
+### 为什么需要两个条件变量
+
+```text
+not_empty_：消费者等待“队列非空”
+not_full_ ：生产者等待“队列未满”
+```
+
+`push()` 在队列满时等待：
+
+```cpp
+not_full_.wait(lock, [this] {
+    return closed_ || queue_.size() < capacity_;
+});
+```
+
+`pop()` 在队列空时等待：
+
+```cpp
+not_empty_.wait(lock, [this] {
+    return closed_ || !queue_.empty();
+});
+```
+
+谓词都包含 `closed_`，确保关闭队列时，正在等待的生产者和消费者能够醒来退出。
+
+### `close()`、`push()`、`pop()` 的顺序
+
+三个操作使用同一个 `mutex_`，因此并发发生时具有明确顺序：
+
+```text
+push 先插入 → 该元素属于关闭前已接受的数据
+close 先生效 → 后续 push 返回 false
+```
+
+`close()` 同时通知两类等待者：
+
+```cpp
+not_full_.notify_all();
+not_empty_.notify_all();
+```
+
+关闭后消费者仍会取完队列中的旧元素；只有 `closed_ == true` 且队列为空时，`pop()` 才返回 `std::nullopt`。
+
+### `optional<T>` 表示队列结束
+
+```cpp
+std::optional<T> pop();
+```
+
+返回值表达两种不同状态：
+
+```text
+包含 T       → 成功取到一个队列元素
+std::nullopt → 队列已经关闭并且彻底排空
+```
+
+因此后台循环可以写成：
+
+```cpp
+while (auto message = queue_.pop()) {
+    writer_.append(*message);
+}
+```
+
+### Stage 2 的 Drain 关闭
+
+`AsyncLogger::shutdown()` 先关闭队列，再等待工作线程：
+
+```text
+queue_.close()
+      ↓
+拒绝新的 push
+      ↓
+消费者继续取完已有日志
+      ↓
+pop() 返回 nullopt
+      ↓
+工作线程退出
+      ↓
+worker_.join()
+```
+
 ## 当前版本保证什么
 
-在调用方正确管理 `LoggerViaPool` 生命周期的前提下，Stage 1 旨在保证：
+在调用方正确管理 `AsyncLogger` 生命周期的前提下，Stage 2 旨在保证：
 
-- 多个调用线程可以通过线程安全的 `submit()` 提交任务；
-- 日志字符串由异步任务拥有，不引用已经销毁的局部变量；
+- 多个生产者可以通过线程安全的 `push()` 提交日志；
+- 队列容量固定，满时生产者等待，不会无限增长；
+- 日志字符串由队列拥有，不引用已经销毁的局部变量；
 - 唯一工作线程串行访问 `FileWriter`；
 - `shutdown()` 处理完已接受任务并等待工作线程退出；
 - 重复调用 `shutdown()` 不会重复 `join()`。
 
 ## 当前版本尚未解决
 
-- 任务队列没有容量上限，高负载下可能持续占用内存；
-- 没有背压策略；
-- 每条日志仍对应一个 `std::function` 和一次独立写入任务；
-- `LoggerViaPool::log()` 无法把后台 I/O 失败直接返回给调用者；
+- 当前只有阻塞生产者这一种背压策略；
+- 每条日志仍对应一次独立的队列操作和文件写入；
+- `AsyncLogger::log()` 无法把后台 I/O 失败直接返回给调用者；
 - 后台任务目前忽略 `FileWriter::append()` 的返回值；
-- 没有批量写入和固定大小缓冲区；
+- 没有批量取出、批量写入和固定大小缓冲区；
 - 没有日志级别、时间、线程 ID 和源码位置；
 - 没有文件滚动、运行统计和自动化测试；
 - 没有定义业务线程调用 `log()` 与对象析构并发发生时的安全保证。

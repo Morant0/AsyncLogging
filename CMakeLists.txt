@@ -37,3 +37,20 @@ target_compile_options(stage1_mini_pool PRIVATE
         -Wconversion
     >
 )
+
+add_executable(stage2_async_queue
+    stages/stage2_async_queue.cpp
+)
+
+target_link_libraries(stage2_async_queue PRIVATE
+    Threads::Threads
+)
+
+target_compile_options(stage2_async_queue PRIVATE
+    $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wconversion
+    >
+)
