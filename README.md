@@ -6,7 +6,8 @@
 
 - Stage 0：同步文件写入；
 - Stage 1：单工作线程任务队列与异步日志边界；
-- Stage 2：专用有界阻塞队列与双生产者日志写入。
+- Stage 2：专用有界阻塞队列与双生产者日志写入；
+- Stage 3：最多 256 条日志的批量消费与合并写入。
 
 ## 当前进度
 
@@ -15,7 +16,7 @@
 | Stage 0：同步日志     | 已完成 | FD 的 RAII、短写、`EINTR`、`fsync()`               |
 | Stage 1：迷你线程池   | 已完成 | 单工作线程、任务队列、条件变量、Drain 关闭、消息所有权 |
 | Stage 2：专用异步队列 | 已完成 | 有界阻塞队列、双条件变量、关闭唤醒、Drain 语义         |
-| Stage 3：批量写入     | 计划中 | 批量取出日志，减少系统调用                             |
+| Stage 3：批量写入     | 已完成 | 批量取出、锁外拼接、合并写入、异常兜底                 |
 | Stage 4：双缓冲       | 计划中 | `FixedBuffer`、锁内交换、锁外 I/O                    |
 | Final：完整日志库     | 计划中 | 格式化、级别、滚动文件、`flush()`、统计与测试        |
 
@@ -64,6 +65,19 @@ flowchart LR
 
 Stage 2 不再把日志包装成通用的 `std::function<void()>`，而是直接传递 `std::string`。队列容量固定为 1024；队列满时生产者等待，形成最基础的阻塞背压。
 
+### Stage 3：批量消费
+
+```mermaid
+flowchart LR
+    P[生产者] -->|push string| Q[BoundedBatchQueue]
+    Q -->|每批最多 256 条| V[vector string]
+    V -->|锁外拼接| B[batch string]
+    B -->|一次 append| F[FileWriter]
+    F --> L[stage3.log]
+```
+
+Stage 3 把“取一条、写一次”改为“取一批、合并后写一次”。队列锁只保护元素搬移，字符串长度统计、拼接和文件 I/O 都在锁外完成。
+
 ## 项目目录
 
 ```text
@@ -74,7 +88,8 @@ AsyncLogging/
 └── stages/
     ├── stage0_sync.cpp
     ├── stage1_mini_pool.cpp
-    └── stage2_async_queue.cpp
+    ├── stage2_async_queue.cpp
+    └── stage3_batch.cpp
 ```
 
 `build/` 和运行生成的 `*.log` 已由 `.gitignore` 排除，不会进入 Git 仓库。
@@ -111,6 +126,7 @@ cmake --build build -j
 cmake --build build --target stage0_sync -j
 cmake --build build --target stage1_mini_pool -j
 cmake --build build --target stage2_async_queue -j
+cmake --build build --target stage3_batch -j
 ```
 
 当前可执行目标：
@@ -120,6 +136,7 @@ cmake --build build --target stage2_async_queue -j
 | `stage0_sync`        | `stages/stage0_sync.cpp`        | 否                           |
 | `stage1_mini_pool`   | `stages/stage1_mini_pool.cpp`   | 是，链接`Threads::Threads` |
 | `stage2_async_queue` | `stages/stage2_async_queue.cpp` | 是，链接`Threads::Threads` |
+| `stage3_batch`       | `stages/stage3_batch.cpp`       | 是，链接`Threads::Threads` |
 
 ## 运行 Stage 0
 
@@ -181,6 +198,7 @@ task 999
 AsyncLogging/build/stage0.log
 AsyncLogging/build/stage1_pool.log
 AsyncLogging/build/stage2.log
+AsyncLogging/build/stage3.log
 ```
 
 ## 运行 Stage 2
@@ -204,6 +222,30 @@ wrote 2000 lines to stage2.log
 ```
 
 两个生产者并发提交，因此两组日志在文件中的交错顺序不固定；但唯一消费者串行写文件，所以每条完整日志不会与另一条日志的字节交叉。
+
+## 运行 Stage 3
+
+在 `build/` 目录中执行：
+
+```bash
+./stage3_batch
+wc -l stage3.log
+head -n 2 stage3.log
+tail -n 2 stage3.log
+```
+
+预期结果：
+
+```text
+wrote 10000 batched lines to stage3.log
+10000 stage3.log
+batched log: 0
+batched log: 1
+batched log: 9998
+batched log: 9999
+```
+
+程序启动时会删除确定的教学输出 `stage3.log`，因此重复运行仍应得到 10000 行。
 
 ## Stage 0 的核心设计
 
@@ -446,26 +488,123 @@ pop() 返回 nullopt
 worker_.join()
 ```
 
+## Stage 3 的核心设计
+
+### 每批最多取 256 条
+
+```cpp
+while (queue_.take_batch(messages, 256)) {
+    // 处理当前批次
+}
+```
+
+队列实际取出数量必须是：
+
+```cpp
+const std::size_t count =
+    std::min(queue_.size(), max_count);
+```
+
+这里必须使用 `std::min`。如果队列只有 10 条却使用 `std::max(..., 256)`，循环会在第 11 次访问空队列，产生未定义行为。
+
+`256` 只是单批上限，不表示消费者必须等满 256 条：第一条日志到达时消费者就会被唤醒，并取走当时已经排队的最多 256 条。低负载下批次可能只有 1 条，延迟较低；高负载产生积压后，批次才会自然变大。
+
+### 锁内只搬移元素
+
+`take_batch()` 持锁完成以下操作：
+
+```text
+等待队列非空或关闭
+      ↓
+确定本批数量
+      ↓
+把队列元素 move 到 vector
+      ↓
+从队列删除这些元素
+      ↓
+释放队列锁
+```
+
+完成搬移后才通知等待队列空间的生产者。消费者不会在持锁期间执行字符串拼接或文件 I/O，避免生产者被慢磁盘长时间阻塞。
+
+### 为什么先统计总字节数
+
+后台线程先计算本批消息总长度：
+
+```cpp
+std::size_t bytes = 0;
+for (const auto& message : messages) {
+    bytes += message.size();
+}
+
+batch.clear();
+batch.reserve(bytes);
+```
+
+`reserve(bytes)` 让 `batch` 一次预留足够空间，减少随后多次 `append()` 引起的扩容和内存复制。
+
+### 合并写入的收益与代价
+
+Stage 2 的近似路径：
+
+```text
+取 256 条日志 → 最多调用 256 次 FileWriter::append()
+```
+
+Stage 3 的路径：
+
+```text
+取 256 条日志 → 拼成一个 batch → 调用 1 次 FileWriter::append()
+```
+
+这能显著减少 `write()` 系统调用次数，但当前版本仍需要：
+
+- 为每条日志保存一个 `std::string`；
+- 把每条日志再复制到 `batch`；
+- 使用 `std::vector<std::string>` 保存批次。
+
+这些分配和复制将在固定缓冲与双缓冲阶段继续优化。
+
+### 最后一个不足 256 条的批次
+
+关闭后队列仍然允许消费者取出剩余数据：
+
+```text
+close()
+   ↓
+拒绝新日志
+   ↓
+take_batch() 取出最后 1～255 条
+   ↓
+写完最后批次
+   ↓
+队列为空且已关闭，take_batch() 返回 false
+   ↓
+工作线程退出并 join
+```
+
+因此“批量大小为 256”不要求日志总数必须是 256 的整数倍。
+
 ## 当前版本保证什么
 
-在调用方正确管理 `AsyncLogger` 生命周期的前提下，Stage 2 旨在保证：
+在调用方正确管理 `BatchLogger` 生命周期的前提下，Stage 3 旨在保证：
 
-- 多个生产者可以通过线程安全的 `push()` 提交日志；
-- 队列容量固定，满时生产者等待，不会无限增长；
-- 日志字符串由队列拥有，不引用已经销毁的局部变量；
+- 队列容量固定，满时生产者等待；
+- 日志字符串由队列和后台批次容器拥有；
+- 每批取出数量不超过 256；
+- 队列锁外完成日志拼接与文件 I/O；
 - 唯一工作线程串行访问 `FileWriter`；
-- `shutdown()` 处理完已接受任务并等待工作线程退出；
-- 重复调用 `shutdown()` 不会重复 `join()`。
+- `shutdown()` 会处理最后一个不满 256 条的批次并 `join()`；
+- 后台线程入口捕获异常，避免异常逃出线程函数直接触发 `std::terminate()`。
 
 ## 当前版本尚未解决
 
 - 当前只有阻塞生产者这一种背压策略；
-- 每条日志仍对应一次独立的队列操作和文件写入；
-- `AsyncLogger::log()` 无法把后台 I/O 失败直接返回给调用者；
-- 后台任务目前忽略 `FileWriter::append()` 的返回值；
-- 没有批量取出、批量写入和固定大小缓冲区；
-- 没有日志级别、时间、线程 ID 和源码位置；
-- 没有文件滚动、运行统计和自动化测试；
+- 前端每条日志仍需要一个独立的 `std::string`；
+- 后台仍需把批次中的字符串复制到 `batch`；
+- 消费者不会主动等待更多日志来凑批，低负载下批次经常只有 1 条，批量收益取决于队列是否已有积压；
+- `BatchLogger::log()` 不能直接报告稍后发生的后台 I/O 失败；
+- 没有固定大小缓冲区和双缓冲复用；
+- 没有日志级别、时间、线程 ID、源码位置和文件滚动；
+- 没有运行统计和自动化测试；
 - 没有定义业务线程调用 `log()` 与对象析构并发发生时的安全保证。
-
-这些限制正是后续阶段要逐一解决的问题。

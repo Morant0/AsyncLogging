@@ -54,3 +54,20 @@ target_compile_options(stage2_async_queue PRIVATE
         -Wconversion
     >
 )
+
+add_executable(stage3_batch
+    stages/stage3_batch.cpp
+)
+
+target_link_libraries(stage3_batch PRIVATE
+    Threads::Threads
+)
+
+target_compile_options(stage3_batch PRIVATE
+    $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wconversion
+    >
+)
