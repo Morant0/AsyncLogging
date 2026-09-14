@@ -7,18 +7,20 @@
 - Stage 0：同步文件写入；
 - Stage 1：单工作线程任务队列与异步日志边界；
 - Stage 2：专用有界阻塞队列与双生产者日志写入；
-- Stage 3：最多 256 条日志的批量消费与合并写入。
+- Stage 3：最多 256 条日志的批量消费与合并写入；
+- Stage 4 前置组件：固定容量连续缓冲区及其单元测试。
 
 ## 当前进度
 
-| 阶段                  | 状态   | 主要内容                                               |
-| --------------------- | ------ | ------------------------------------------------------ |
-| Stage 0：同步日志     | 已完成 | FD 的 RAII、短写、`EINTR`、`fsync()`               |
-| Stage 1：迷你线程池   | 已完成 | 单工作线程、任务队列、条件变量、Drain 关闭、消息所有权 |
-| Stage 2：专用异步队列 | 已完成 | 有界阻塞队列、双条件变量、关闭唤醒、Drain 语义         |
-| Stage 3：批量写入     | 已完成 | 批量取出、锁外拼接、合并写入、异常兜底                 |
-| Stage 4：双缓冲       | 计划中 | `FixedBuffer`、锁内交换、锁外 I/O                    |
-| Final：完整日志库     | 计划中 | 格式化、级别、滚动文件、`flush()`、统计与测试        |
+| 阶段                   | 状态   | 主要内容                                               |
+| ---------------------- | ------ | ------------------------------------------------------ |
+| Stage 0：同步日志      | 已完成 | FD 的 RAII、短写、`EINTR`、`fsync()`               |
+| Stage 1：迷你线程池    | 已完成 | 单工作线程、任务队列、条件变量、Drain 关闭、消息所有权 |
+| Stage 2：专用异步队列  | 已完成 | 有界阻塞队列、双条件变量、关闭唤醒、Drain 语义         |
+| Stage 3：批量写入      | 已完成 | 批量取出、锁外拼接、合并写入、异常兜底                 |
+| Stage 4 前置：固定缓冲 | 已完成 | `FixedBuffer`、容量边界、快速复用、单元测试          |
+| Stage 4：双缓冲        | 计划中 | Buffer 所有权转移、锁内交换、锁外 I/O                  |
+| Final：完整日志库      | 计划中 | 格式化、级别、滚动文件、`flush()`、统计与测试        |
 
 ## 当前架构
 
@@ -78,6 +80,24 @@ flowchart LR
 
 Stage 3 把“取一条、写一次”改为“取一批、合并后写一次”。队列锁只保护元素搬移，字符串长度统计、拼接和文件 I/O 都在锁外完成。
 
+### Stage 4 前置：固定缓冲区
+
+```text
+多条日志
+   │ append(string_view)
+   ▼
+┌──────────────────────────────┐
+│ FixedBuffer<Capacity>        │
+│ data_[0, size_)：有效字节     │
+│ records_：成功追加次数        │
+└──────────────────────────────┘
+   │ 满后整体交给后台
+   ▼
+批量文件写入
+```
+
+`FixedBuffer` 使用编译期固定容量的连续数组，追加过程中不自动扩容。当前先把它作为独立组件实现并测试，下一步再接入双缓冲日志器。
+
 ## 项目目录
 
 ```text
@@ -85,11 +105,16 @@ AsyncLogging/
 ├── CMakeLists.txt
 ├── README.md
 ├── .gitignore
-└── stages/
+├── stages/
     ├── stage0_sync.cpp
     ├── stage1_mini_pool.cpp
     ├── stage2_async_queue.cpp
     └── stage3_batch.cpp
+├── final/minilog/
+│   └── fixed_buffer.hpp
+└── tests/
+    ├── fixed_buffer_test.cpp
+    └── test_support.hpp
 ```
 
 `build/` 和运行生成的 `*.log` 已由 `.gitignore` 排除，不会进入 Git 仓库。
@@ -127,6 +152,7 @@ cmake --build build --target stage0_sync -j
 cmake --build build --target stage1_mini_pool -j
 cmake --build build --target stage2_async_queue -j
 cmake --build build --target stage3_batch -j
+cmake --build build --target fixed_buffer_test -j
 ```
 
 当前可执行目标：
@@ -137,6 +163,7 @@ cmake --build build --target stage3_batch -j
 | `stage1_mini_pool`   | `stages/stage1_mini_pool.cpp`   | 是，链接`Threads::Threads` |
 | `stage2_async_queue` | `stages/stage2_async_queue.cpp` | 是，链接`Threads::Threads` |
 | `stage3_batch`       | `stages/stage3_batch.cpp`       | 是，链接`Threads::Threads` |
+| `fixed_buffer_test`  | `tests/fixed_buffer_test.cpp`   | 否                           |
 
 ## 运行 Stage 0
 
@@ -246,6 +273,31 @@ batched log: 9999
 ```
 
 程序启动时会删除确定的教学输出 `stage3.log`，因此重复运行仍应得到 10000 行。
+
+## 运行 FixedBuffer 单元测试
+
+推荐通过 CTest 运行：
+
+```bash
+cmake --build build --target fixed_buffer_test -j
+ctest --test-dir build --output-on-failure
+```
+
+预期结果：
+
+```text
+Start 1: fixed_buffer_test
+1/1 Test #1: fixed_buffer_test ... Passed
+100% tests passed, 0 tests failed out of 1
+```
+
+测试成功时通常不会打印额外正文；任一 `TEST_REQUIRE(...)` 失败时，程序会报告表达式、文件和行号并终止。
+
+也可以在 `build/` 目录直接运行：
+
+```bash
+./fixed_buffer_test
+```
 
 ## Stage 0 的核心设计
 
@@ -585,6 +637,64 @@ take_batch() 取出最后 1～255 条
 
 因此“批量大小为 256”不要求日志总数必须是 256 的整数倍。
 
+## FixedBuffer 的核心设计
+
+### 为什么模板实现放在头文件
+
+```cpp
+template <std::size_t Capacity>
+class FixedBuffer;
+```
+
+`Capacity` 是编译期非类型模板参数。编译器在看到 `FixedBuffer<8>`、`FixedBuffer<64 * 1024>` 等具体实例时，需要同时看到完整模板定义，所以当前组件直接实现在：
+
+```text
+final/minilog/fixed_buffer.hpp
+```
+
+它不需要单独的 `.cpp` 文件或静态库。CMake 只需让测试目标能够从 `final/` 找到 `minilog/fixed_buffer.hpp`。
+
+### 四个核心不变量
+
+```text
+0 <= size_ <= Capacity
+data_[0, size_) 是有效字节
+available() == Capacity - size_
+append() 要么完整成功，要么完全不修改状态
+```
+
+数据没有额外的 `\0` 终止符，因此读取时必须同时使用 `data()` 和 `size()`：
+
+```cpp
+std::string_view bytes(buffer.data(), buffer.size());
+```
+
+### 为什么 `reset()` 不清零数组
+
+```cpp
+void reset() noexcept {
+    size_ = 0;
+    records_ = 0;
+}
+```
+
+有效范围由 `[0, size_)` 定义。重置元数据后，旧字节即使仍留在数组里，也不再属于有效内容；下一次追加会从下标 0 开始覆盖。因此 `reset()` 是 O(1)，不用每次遍历并清零整个缓冲区。
+
+### 单元测试覆盖什么
+
+`FixedBuffer<8>` 使用很小的容量，专门覆盖边界：
+
+```text
+初始为空、可用容量为 8
+追加 7 字节成功
+再追加 1 字节，恰好填满
+追加第 9 字节失败
+失败后 size 和 records 不变
+reset 后恢复为空并能再次追加
+```
+
+测试使用 `TEST_REQUIRE`，而不是可能在 Release 构建中被 `NDEBUG` 删除的标准 `assert()`。这样无论 Debug 还是 Release，测试表达式都会执行。
+
 ## 当前版本保证什么
 
 在调用方正确管理 `BatchLogger` 生命周期的前提下，Stage 3 旨在保证：
@@ -595,7 +705,10 @@ take_batch() 取出最后 1～255 条
 - 队列锁外完成日志拼接与文件 I/O；
 - 唯一工作线程串行访问 `FileWriter`；
 - `shutdown()` 会处理最后一个不满 256 条的批次并 `join()`；
-- 后台线程入口捕获异常，避免异常逃出线程函数直接触发 `std::terminate()`。
+- 后台线程入口捕获异常，避免异常逃出线程函数直接触发 `std::terminate()`；
+- `FixedBuffer` 不会写出固定数组边界；
+- 缓冲区溢出失败不会修改已有长度和记录数；
+- `FixedBuffer::reset()` 后可以复用同一块内存。
 
 ## 当前版本尚未解决
 
@@ -604,7 +717,7 @@ take_batch() 取出最后 1～255 条
 - 后台仍需把批次中的字符串复制到 `batch`；
 - 消费者不会主动等待更多日志来凑批，低负载下批次经常只有 1 条，批量收益取决于队列是否已有积压；
 - `BatchLogger::log()` 不能直接报告稍后发生的后台 I/O 失败；
-- 没有固定大小缓冲区和双缓冲复用；
+- `FixedBuffer` 尚未接入异步日志数据流，也没有双缓冲所有权交换与回收；
 - 没有日志级别、时间、线程 ID、源码位置和文件滚动；
-- 没有运行统计和自动化测试；
+- 目前只有 FixedBuffer 边界测试，还没有并发、关闭和 I/O 失败测试；
 - 没有定义业务线程调用 `log()` 与对象析构并发发生时的安全保证。

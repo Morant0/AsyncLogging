@@ -71,3 +71,31 @@ target_compile_options(stage3_batch PRIVATE
         -Wconversion
     >
 )
+
+enable_testing()
+
+add_executable(fixed_buffer_test
+    tests/fixed_buffer_test.cpp
+)
+
+target_include_directories(fixed_buffer_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/final
+)
+
+target_compile_options(fixed_buffer_test PRIVATE
+    $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wconversion
+    >
+)
+
+add_test(
+    NAME fixed_buffer_test
+    COMMAND fixed_buffer_test
+)
+
+set_tests_properties(fixed_buffer_test PROPERTIES
+    TIMEOUT 10
+)
