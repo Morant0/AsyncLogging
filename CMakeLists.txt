@@ -72,6 +72,23 @@ target_compile_options(stage3_batch PRIVATE
     >
 )
 
+add_executable(stage4_double_buffer
+    stages/stage4_double_buffer.cpp
+)
+
+target_link_libraries(stage4_double_buffer PRIVATE
+    Threads::Threads
+)
+
+target_compile_options(stage4_double_buffer PRIVATE
+    $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wconversion
+    >
+)
+
 enable_testing()
 
 add_executable(fixed_buffer_test

@@ -8,7 +8,8 @@
 - Stage 1：单工作线程任务队列与异步日志边界；
 - Stage 2：专用有界阻塞队列与双生产者日志写入；
 - Stage 3：最多 256 条日志的批量消费与合并写入；
-- Stage 4 前置组件：固定容量连续缓冲区及其单元测试。
+- Stage 4 前置组件：固定容量连续缓冲区及其单元测试；
+- Stage 4：固定缓冲区所有权交换与后台批量写入。
 
 ## 当前进度
 
@@ -19,7 +20,7 @@
 | Stage 2：专用异步队列  | 已完成 | 有界阻塞队列、双条件变量、关闭唤醒、Drain 语义         |
 | Stage 3：批量写入      | 已完成 | 批量取出、锁外拼接、合并写入、异常兜底                 |
 | Stage 4 前置：固定缓冲 | 已完成 | `FixedBuffer`、容量边界、快速复用、单元测试          |
-| Stage 4：双缓冲        | 计划中 | Buffer 所有权转移、锁内交换、锁外 I/O                  |
+| Stage 4：双缓冲        | 已完成 | Buffer 所有权转移、定时刷新、阻塞背压、锁外 I/O        |
 | Final：完整日志库      | 计划中 | 格式化、级别、滚动文件、`flush()`、统计与测试        |
 
 ## 当前架构
@@ -96,7 +97,22 @@ Stage 3 把“取一条、写一次”改为“取一批、合并后写一次”
 批量文件写入
 ```
 
-`FixedBuffer` 使用编译期固定容量的连续数组，追加过程中不自动扩容。当前先把它作为独立组件实现并测试，下一步再接入双缓冲日志器。
+`FixedBuffer` 使用编译期固定容量的连续数组，追加过程中不自动扩容。当前先把它作为独立组件实现并测试，再接入双缓冲日志器。
+
+### Stage 4：双缓冲日志器
+
+```mermaid
+flowchart LR
+    P1[生产者 A] --> C[current Buffer]
+    P2[生产者 B] --> C
+    C -->|满、超时或关闭| Q[pending Buffers]
+    N[next Buffer] -->|替换 current| C
+    Q -->|swap 到局部队列| W[后台线程]
+    W -->|锁外 append| F[FileWriter]
+    W -->|reset 回收一个| N
+```
+
+生产者只向 `current_` 追加；当前缓冲放不下时，将其所有权移动到 `pending_`，再换上 `next_` 或新缓冲。后台线程快速把 `pending_` 交换到局部容器，释放锁后再执行文件 I/O，因此生产者和磁盘写入可以使用不同 Buffer 并行工作。
 
 ## 项目目录
 
@@ -106,10 +122,11 @@ AsyncLogging/
 ├── README.md
 ├── .gitignore
 ├── stages/
-    ├── stage0_sync.cpp
-    ├── stage1_mini_pool.cpp
-    ├── stage2_async_queue.cpp
-    └── stage3_batch.cpp
+│   ├── stage0_sync.cpp
+│   ├── stage1_mini_pool.cpp
+│   ├── stage2_async_queue.cpp
+│   ├── stage3_batch.cpp
+│   └── stage4_double_buffer.cpp
 ├── final/minilog/
 │   └── fixed_buffer.hpp
 └── tests/
@@ -152,18 +169,20 @@ cmake --build build --target stage0_sync -j
 cmake --build build --target stage1_mini_pool -j
 cmake --build build --target stage2_async_queue -j
 cmake --build build --target stage3_batch -j
+cmake --build build --target stage4_double_buffer -j
 cmake --build build --target fixed_buffer_test -j
 ```
 
 当前可执行目标：
 
-| 目标                   | 源文件                            | 是否需要线程库               |
-| ---------------------- | --------------------------------- | ---------------------------- |
-| `stage0_sync`        | `stages/stage0_sync.cpp`        | 否                           |
-| `stage1_mini_pool`   | `stages/stage1_mini_pool.cpp`   | 是，链接`Threads::Threads` |
-| `stage2_async_queue` | `stages/stage2_async_queue.cpp` | 是，链接`Threads::Threads` |
-| `stage3_batch`       | `stages/stage3_batch.cpp`       | 是，链接`Threads::Threads` |
-| `fixed_buffer_test`  | `tests/fixed_buffer_test.cpp`   | 否                           |
+| 目标                     | 源文件                              | 是否需要线程库               |
+| ------------------------ | ----------------------------------- | ---------------------------- |
+| `stage0_sync`          | `stages/stage0_sync.cpp`          | 否                           |
+| `stage1_mini_pool`     | `stages/stage1_mini_pool.cpp`     | 是，链接`Threads::Threads` |
+| `stage2_async_queue`   | `stages/stage2_async_queue.cpp`   | 是，链接`Threads::Threads` |
+| `stage3_batch`         | `stages/stage3_batch.cpp`         | 是，链接`Threads::Threads` |
+| `stage4_double_buffer` | `stages/stage4_double_buffer.cpp` | 是，链接`Threads::Threads` |
+| `fixed_buffer_test`    | `tests/fixed_buffer_test.cpp`     | 否                           |
 
 ## 运行 Stage 0
 
@@ -273,6 +292,28 @@ batched log: 9999
 ```
 
 程序启动时会删除确定的教学输出 `stage3.log`，因此重复运行仍应得到 10000 行。
+
+## 运行 Stage 4
+
+在 `build/` 目录中执行：
+
+```bash
+./stage4_double_buffer
+wc -l stage4.log
+grep -c '^producer A:' stage4.log
+grep -c '^producer B:' stage4.log
+```
+
+预期结果：
+
+```text
+wrote 10000 lines to stage4.log
+10000 stage4.log
+5000
+5000
+```
+
+两个生产者的日志交错顺序由线程调度决定；验收重点是总数 10000、每个生产者各 5000，并且每一行保持完整。
 
 ## 运行 FixedBuffer 单元测试
 
@@ -695,29 +736,121 @@ reset 后恢复为空并能再次追加
 
 测试使用 `TEST_REQUIRE`，而不是可能在 Release 构建中被 `NDEBUG` 删除的标准 `assert()`。这样无论 Debug 还是 Release，测试表达式都会执行。
 
+## Stage 4 的核心设计
+
+### 三类 Buffer 的职责
+
+```text
+current_：生产者正在追加日志
+next_   ：预留的空 Buffer，切换时优先复用
+pending_：已提交、等待后台线程写入的 Buffer
+```
+
+它们都由 `std::unique_ptr` 管理。切换时只转移指针所有权，不复制 64 KiB 的数组：
+
+```cpp
+pending_.push_back(std::move(current_));
+current_ = next_
+    ? std::move(next_)
+    : std::make_unique<Buffer>();
+```
+
+### 前台追加与阻塞背压
+
+单条日志先追加换行，并拒绝超过 Buffer 容量的消息。当前 Buffer 放不下时，生产者等待：
+
+```cpp
+space_available_.wait(lock, [this] {
+    return !running_
+        || pending_.size() < max_pending_buffers_;
+});
+```
+
+如果待写 Buffer 已达到上限，生产者阻塞，防止共享积压无限增长。等待会释放互斥锁，使后台线程能够取走 `pending_`。
+
+重新获得锁后必须再次检查 `current_->available()`：等待期间，后台线程可能已经定时提交了原来的半满 Buffer，并换上新的空 Buffer。
+
+### 定时提交半满 Buffer
+
+后台线程使用：
+
+```cpp
+work_available_.wait_for(
+    lock,
+    flush_interval_,
+    [this] {
+        return !running_ || !pending_.empty();
+    }
+);
+```
+
+等待结束可能是因为有写满 Buffer、开始关闭或定时器超时。即使流量很低，超时后也会把非空 `current_` 交给后台，避免少量日志长期停留在内存中。
+
+### 锁内交换，锁外 I/O
+
+后台在线程共享锁内执行：
+
+```cpp
+pending_.swap(buffers_to_write);
+```
+
+交换后，共享 `pending_` 立即变空，后台线程独占局部 `buffers_to_write`。离开锁作用域后才遍历 Buffer 并调用 `writer_.append()`，因此慢速磁盘 I/O 不会一直占用生产者需要的互斥锁。
+
+### 为什么只回收一个备用 Buffer
+
+写完后，后台线程从本批取出一个 Buffer：
+
+```cpp
+BufferPtr recycled =
+    std::move(buffers_to_write.back());
+recycled->reset();
+```
+
+如果 `next_` 为空，就把它保存为备用缓冲；其余 Buffer 随局部队列清空而释放。这样正常运行时可以复用 Buffer，同时避免流量洪峰结束后长期保留大量 64 KiB 内存块。
+
+### Stage 4 的 Drain 关闭
+
+```text
+running_ = false
+      ↓
+唤醒后台线程和被背压阻塞的生产者
+      ↓
+提交最后一个非空 current_
+      ↓
+写完 pending_ 和本地待写 Buffer
+      ↓
+确认没有剩余数据
+      ↓
+工作线程退出并 join
+```
+
+后台不能在看到 `running_ == false` 时立即退出；只有已经接受的数据全部尝试写出后才能结束。
+
 ## 当前版本保证什么
 
-在调用方正确管理 `BatchLogger` 生命周期的前提下，Stage 3 旨在保证：
+在调用方正确管理 `DoubleBufferLogger` 生命周期的前提下，Stage 4 旨在保证：
 
-- 队列容量固定，满时生产者等待；
-- 日志字符串由队列和后台批次容器拥有；
-- 每批取出数量不超过 256；
-- 队列锁外完成日志拼接与文件 I/O；
+- 单条日志不会越过 64 KiB Buffer 边界；
+- 多个生产者在同一互斥锁下追加日志；
+- 共享 `pending_` 达到配置上限时生产者阻塞；
+- Buffer 通过 `unique_ptr` 转移所有权，不复制整个固定数组；
+- 后台线程定时提交低流量下的半满 Buffer；
+- 后台在共享锁外完成文件 I/O；
 - 唯一工作线程串行访问 `FileWriter`；
-- `shutdown()` 会处理最后一个不满 256 条的批次并 `join()`；
+- `shutdown()` 会提交最后一个半满 Buffer、尝试写完已接受数据并 `join()`；
 - 后台线程入口捕获异常，避免异常逃出线程函数直接触发 `std::terminate()`；
 - `FixedBuffer` 不会写出固定数组边界；
-- 缓冲区溢出失败不会修改已有长度和记录数；
 - `FixedBuffer::reset()` 后可以复用同一块内存。
 
 ## 当前版本尚未解决
 
 - 当前只有阻塞生产者这一种背压策略；
 - 前端每条日志仍需要一个独立的 `std::string`；
-- 后台仍需把批次中的字符串复制到 `batch`；
-- 消费者不会主动等待更多日志来凑批，低负载下批次经常只有 1 条，批量收益取决于队列是否已有积压；
-- `BatchLogger::log()` 不能直接报告稍后发生的后台 I/O 失败；
-- `FixedBuffer` 尚未接入异步日志数据流，也没有双缓冲所有权交换与回收；
+- 当前只有定时刷新，没有可等待完成的显式 `flush()` 屏障；
+- `DoubleBufferLogger::log()` 不能直接报告稍后发生的后台 I/O 失败；
+- 写入失败只输出到标准错误，没有错误码、失败记录数或重试策略；
+- `max_pending_buffers` 只限制共享积压，不是整个进程所有 Buffer 的严格内存上限；
+- `append()` 成功表示数据交给内核，不等于已经通过 `fsync()` 持久化；
 - 没有日志级别、时间、线程 ID、源码位置和文件滚动；
-- 目前只有 FixedBuffer 边界测试，还没有并发、关闭和 I/O 失败测试；
+- 目前只有 FixedBuffer 边界测试，还没有双缓冲并发、定时刷新、关闭和 I/O 失败自动化测试；
 - 没有定义业务线程调用 `log()` 与对象析构并发发生时的安全保证。
