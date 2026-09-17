@@ -9,7 +9,8 @@
 - Stage 2：专用有界阻塞队列与双生产者日志写入；
 - Stage 3：最多 256 条日志的批量消费与合并写入；
 - Stage 4 前置组件：固定容量连续缓冲区及其单元测试；
-- Stage 4：固定缓冲区所有权交换与后台批量写入。
+- Stage 4：固定缓冲区所有权交换与后台批量写入；
+- Final 前置组件：可复用的 `FileWriter` 与按大小滚动的 `RollingFile`。
 
 ## 当前进度
 
@@ -21,7 +22,8 @@
 | Stage 3：批量写入      | 已完成 | 批量取出、锁外拼接、合并写入、异常兜底                 |
 | Stage 4 前置：固定缓冲 | 已完成 | `FixedBuffer`、容量边界、快速复用、单元测试          |
 | Stage 4：双缓冲        | 已完成 | Buffer 所有权转移、定时刷新、阻塞背压、锁外 I/O        |
-| Final：完整日志库      | 计划中 | 格式化、级别、滚动文件、`flush()`、统计与测试        |
+| Final 前置：滚动文件 | 已完成 | `FileWriter`、`RollingFile`、大小阈值、超大单条、单元测试 |
+| Final：完整日志库      | 计划中 | 格式化、级别、`flush()`、统计与更完整的测试            |
 
 ## 当前架构
 
@@ -114,6 +116,24 @@ flowchart LR
 
 生产者只向 `current_` 追加；当前缓冲放不下时，将其所有权移动到 `pending_`，再换上 `next_` 或新缓冲。后台线程快速把 `pending_` 交换到局部容器，释放锁后再执行文件 I/O，因此生产者和磁盘写入可以使用不同 Buffer 并行工作。
 
+### Final 前置：滚动文件
+
+```text
+RollingFile::append(data)
+          │
+          ├─ 当前文件仍能容纳 ───▶ FileWriter::append(data)
+          │
+          └─ 追加后会超过阈值
+                     │
+                     ▼
+              先打开新文件
+                     │ 成功
+                     ▼
+              替换 writer_ 后写入
+```
+
+`RollingFile` 不自己处理短写和 `EINTR`，而是复用 `FileWriter`。它在追加整条数据之前检查大小；如果当前文件非空且新数据会越过阈值，就先滚动再写入。一条数据本身大于阈值时，仍会被完整写入一个新文件，不会拆分或丢弃。
+
 ## 项目目录
 
 ```text
@@ -127,10 +147,17 @@ AsyncLogging/
 │   ├── stage2_async_queue.cpp
 │   ├── stage3_batch.cpp
 │   └── stage4_double_buffer.cpp
-├── final/minilog/
-│   └── fixed_buffer.hpp
+├── final/
+│   ├── minilog/
+│   │   ├── file_writer.hpp
+│   │   ├── fixed_buffer.hpp
+│   │   └── rolling_file.hpp
+│   └── src/
+│       ├── file_writer.cpp
+│       └── rolling_file.cpp
 └── tests/
     ├── fixed_buffer_test.cpp
+    ├── rolling_file_test.cpp
     └── test_support.hpp
 ```
 
@@ -171,9 +198,10 @@ cmake --build build --target stage2_async_queue -j
 cmake --build build --target stage3_batch -j
 cmake --build build --target stage4_double_buffer -j
 cmake --build build --target fixed_buffer_test -j
+cmake --build build --target rolling_file_test -j
 ```
 
-当前可执行目标：
+当前构建目标：
 
 | 目标                     | 源文件                              | 是否需要线程库               |
 | ------------------------ | ----------------------------------- | ---------------------------- |
@@ -183,6 +211,8 @@ cmake --build build --target fixed_buffer_test -j
 | `stage3_batch`         | `stages/stage3_batch.cpp`         | 是，链接`Threads::Threads` |
 | `stage4_double_buffer` | `stages/stage4_double_buffer.cpp` | 是，链接`Threads::Threads` |
 | `fixed_buffer_test`    | `tests/fixed_buffer_test.cpp`     | 否                           |
+| `minilog_file`         | `final/src/file_writer.cpp`、`rolling_file.cpp` | 否，静态库 |
+| `rolling_file_test`    | `tests/rolling_file_test.cpp`     | 否，链接 `minilog_file` |
 
 ## 运行 Stage 0
 
@@ -321,7 +351,7 @@ wrote 10000 lines to stage4.log
 
 ```bash
 cmake --build build --target fixed_buffer_test -j
-ctest --test-dir build --output-on-failure
+ctest --test-dir build -R fixed_buffer_test --output-on-failure
 ```
 
 预期结果：
@@ -339,6 +369,23 @@ Start 1: fixed_buffer_test
 ```bash
 ./fixed_buffer_test
 ```
+
+## 运行 RollingFile 单元测试
+
+```bash
+cmake --build build --target rolling_file_test -j
+ctest --test-dir build -R rolling_file_test --output-on-failure
+```
+
+测试会在系统临时目录创建一个唯一子目录，以 10 字节为滚动阈值，依次写入 6、6、20 和 1 字节的数据。预期生成 4 个文件，按文件名排序后拼接内容，应与原始写入顺序完全一致。测试通过后会删除临时目录。
+
+运行全部测试：
+
+```bash
+ctest --test-dir build --output-on-failure
+```
+
+当前应看到 `fixed_buffer_test` 和 `rolling_file_test` 两项测试全部通过。
 
 ## Stage 0 的核心设计
 
@@ -826,6 +873,55 @@ running_ = false
 
 后台不能在看到 `running_ == false` 时立即退出；只有已经接受的数据全部尝试写出后才能结束。
 
+## RollingFile 的核心设计
+
+### 为什么抽成 `minilog_file` 静态库
+
+`FileWriter` 和 `RollingFile` 不是单个演示程序，而是后续完整日志器要复用的组件。CMake 将它们编译成：
+
+```text
+libminilog_file.a
+```
+
+`target_include_directories(minilog_file PUBLIC .../final)` 表示：库自己及链接该库的目标，都可以使用：
+
+```cpp
+#include "minilog/rolling_file.hpp"
+```
+
+因此 `rolling_file_test` 只需链接 `minilog_file`，无需再重复配置头文件查找路径。
+
+### 先创建再替换
+
+滚动时不直接销毁旧写入器，而是先创建候选对象：
+
+```cpp
+auto replacement = std::make_unique<FileWriter>(make_filename());
+writer_.swap(replacement);
+```
+
+只有新文件成功打开后才交换所有权。如果构造 `replacement` 时打开文件失败，`writer_` 仍然指向旧文件，不会先丢掉已有写入器。
+
+### 滚动判断和超大单条
+
+```text
+当前文件为空       → 直接写入
+追加后不超过阈值 → 继续写当前文件
+追加后会超过阈值 → 先滚动，再完整写入
+```
+
+阈值是“下一条是否需要新文件”的判断依据，不是把一条日志强行切碎的硬上限。因此一条 20 字节数据在 10 字节阈值下仍会完整落入同一个新文件；下一次追加前再次滚动。
+
+### 文件名如何避免冲突
+
+当前文件名组合了：
+
+```text
+基础名 + 本地时间 + 微秒 + PID + 实例编号 + 序列号 + .log
+```
+
+PID 区分进程，原子递增的实例编号区分同一进程内的多个 `RollingFile`，序列号区分同一实例连续生成的文件。
+
 ## 当前版本保证什么
 
 在调用方正确管理 `DoubleBufferLogger` 生命周期的前提下，Stage 4 旨在保证：
@@ -841,6 +937,10 @@ running_ = false
 - 后台线程入口捕获异常，避免异常逃出线程函数直接触发 `std::terminate()`；
 - `FixedBuffer` 不会写出固定数组边界；
 - `FixedBuffer::reset()` 后可以复用同一块内存。
+- `RollingFile` 在整条数据会越过阈值时先切换文件；
+- 超过阈值的单条数据仍会完整写入；
+- 滚动创建新文件失败时，旧 `FileWriter` 仍保持有效；
+- `RollingFile::sync()` 可将持久化请求传递给当前 `FileWriter`。
 
 ## 当前版本尚未解决
 
@@ -851,6 +951,7 @@ running_ = false
 - 写入失败只输出到标准错误，没有错误码、失败记录数或重试策略；
 - `max_pending_buffers` 只限制共享积压，不是整个进程所有 Buffer 的严格内存上限；
 - `append()` 成功表示数据交给内核，不等于已经通过 `fsync()` 持久化；
-- 没有日志级别、时间、线程 ID、源码位置和文件滚动；
-- 目前只有 FixedBuffer 边界测试，还没有双缓冲并发、定时刷新、关闭和 I/O 失败自动化测试；
+- 滚动文件尚未接入 Stage 4 的双缓冲日志器；
+- 没有日志级别、时间、线程 ID 和源码位置；
+- 目前只有 FixedBuffer 与 RollingFile 的组件测试，还没有双缓冲并发、定时刷新、关闭和 I/O 失败自动化测试；
 - 没有定义业务线程调用 `log()` 与对象析构并发发生时的安全保证。

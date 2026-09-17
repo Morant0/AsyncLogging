@@ -8,6 +8,24 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Threads REQUIRED)
 
+add_library(minilog_file STATIC
+    final/src/file_writer.cpp
+    final/src/rolling_file.cpp
+)
+
+target_include_directories(minilog_file PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/final
+)
+
+target_compile_options(minilog_file PRIVATE
+    $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wconversion
+    >
+)
+
 add_executable(stage0_sync
     stages/stage0_sync.cpp
 )
@@ -114,5 +132,31 @@ add_test(
 )
 
 set_tests_properties(fixed_buffer_test PROPERTIES
+    TIMEOUT 10
+)
+
+add_executable(rolling_file_test
+    tests/rolling_file_test.cpp
+)
+
+target_link_libraries(rolling_file_test PRIVATE
+    minilog_file
+)
+
+target_compile_options(rolling_file_test PRIVATE
+    $<$<CXX_COMPILER_ID:AppleClang,Clang,GNU>:
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Wconversion
+    >
+)
+
+add_test(
+    NAME rolling_file_test
+    COMMAND rolling_file_test
+)
+
+set_tests_properties(rolling_file_test PROPERTIES
     TIMEOUT 10
 )
